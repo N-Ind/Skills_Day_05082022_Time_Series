@@ -1,0 +1,466 @@
+---
+title: "Skills Day Time Series"
+author: "Nils Indreiten"
+date: "2022-05-08"
+format:
+  html:
+    code-fold: true
+    code-summary: "Show the code"
+    toc: true
+    theme:
+      light: flatly
+---
+
+```{r setup, include=FALSE}
+pacman::p_load(tidyverse,
+               modeltime,
+               timetk,
+               lubridate,
+               tidymodels,
+               plotly,
+               RJDBC,
+               DBI,
+               dotenv)
+load_dot_env("cred.env")
+values <- c("#EB0050", "#143C75", "#4BB9A0", "#ECBF08")
+# Retrieving data:
+library(RJDBC)
+library(DBI)
+jdbcDriver <-
+  JDBC(driverClass = "com.snowflake.client.jdbc.SnowflakeDriver",
+       classPath = "/Users/nils.indreiten/Documents/Best_Practices/Snowflake_Driver/snowflake-jdbc-3.13.5.jar")
+url <- "snowflake://sainsburys.eu-west-1.snowflakecomputing.com"
+role <- "MARKETING_CUSTOMER_ANALYTICS"
+proxy <-
+  "&useProxy=true&proxyHost=a-proxy-p.bc.jsplc.net&proxyPort=8080&proxyUser=nils.indreiten@sainsburys.co.uk"
+user <- "nils.indreiten@sainsburys.co.uk"
+db <- "CUSTOMER_ANALYTICS"
+schema <- "SANDBOX"
+warehouse <- "ADW_LARGE_ADHOC_WH"
+password <- Sys.getenv("PASSWORD")
+snowflake <- DBI::dbConnect(
+  jdbcDriver,
+  glue::glue(
+    "jdbc:{url}?role={role}&insecureMode=true&warehouse={warehouse}&db={db}&schema={schema}&{proxy}"
+  ),
+  user = user,
+  password = password
+)
+
+# Returning Query Results:
+
+Forecasting_df <- dbGetQuery(
+  snowflake,
+  "select a.week_no, a.registrations, a.total_registrations, a.seasonality_actual, a.registration_forecast,b.date_key
+from Customer_Analytics.Reporting.DigNec_Registration_Forecast a
+         inner join ADW_PROD.INC_PL.DATE_DIM b
+                    on a.week_no = b.week_no
+order by week_no"
+)
+
+# Disconnect:
+dbDisconnect(snowflake)
+```
+
+# Overview and Objectives
+
+For skills day on 05-08-2022 I sought to improve my skills in time series 
+forecasting in R. The main aim is to gain practical experience with automatic,
+hybrid and machine learning techniques. Although overall performance is lacking
+this is more of a proof of concept and comparative exercise. Best practices are 
+adhered to however a lot more can be done in terms of hyper parameter tuning,
+seasonality adjustment, and pre-processing. 
+
+## Executive Summary
+
+This analysis proposes several procedures for forecasting digital nectar 
+registrations. It explores automated, machine learning, and a combination of the 
+2. Most importantly the forecasting accuracy is benchmarked against both actual
+and forecast numbers. Reccommendations and next steps are provided for future
+analysis efforts, most notable the suitability of the random forest model relative
+to the others and preprocessing/data granulairity issues that should address
+lack of expected performance.
+
+# Exploring DN Registrations - A Temporal View
+
+In order to make the exercise more relevant the data for Digital Nectar registrations
+was retrieved from the `Customer_Analytics.Reporting.DigNec_Registration_Forecast`
+table. The plot below shows us a huge spike in DN registrations, around launch.
+Thereafter stabilizing from the 28th of December 2019 onwards. The smoothed line 
+shows the trend over the time period in question. 
+
+```{r}
+#| message: false
+ Forecasting_df %>%
+  as_tibble() %>%
+  select(WEEK_NO, DATE_KEY, REGISTRATIONS, REGISTRATION_FORECAST) -> DN_numbs
+
+DN_numbs %>% 
+  group_by(WEEK_NO) %>% 
+  summarise(DATE_KEY = max(DATE_KEY),
+            REGISTRATIONS = as.numeric(REGISTRATIONS),
+            REGISTRATION_FORECAST = as.numeric(REGISTRATION_FORECAST)) %>% 
+  distinct() %>% 
+  ungroup() %>% 
+  mutate(DATE_KEY = date(DATE_KEY))-> DN_numbs
+
+## Plot the general trend to pick out any patterns:
+
+DN_numbs %>% 
+select(DATE_KEY, REGISTRATIONS) %>% 
+  set_names(c("date","value")) -> dn_numbs_tbl
+
+dn_numbs_tbl %>% 
+  plot_time_series(date,value,.interactive = TRUE)
+```
+
+This analysis will focus on subset of the data, looking at registrations
+between the 1st of April 2021 to the 6th of August 2022. This time range is seen 
+in the plot below.
+
+```{r}
+dn_numbs_tbl %>% 
+  filter(date >='2021-04-01'& date <= '2022-08-06') -> dn_numbs_tbl
+
+dn_numbs_tbl %>% 
+  plot_time_series(date,value,.interactive = TRUE,.title = "Subset Time Series")
+
+```
+
+The plot above does a good job of demonstrating the patterns in the registrations
+on an annual basis, the trend line shows this over the time period. In order to
+make the time series more robust, a cross validation dataset is developed,
+this is highighed in the output below:
+
+```{r}
+set.seed(1234)
+splits <-  dn_numbs_tbl %>% 
+  time_series_split(assess = "3 months", cumulative = TRUE,date_var = date) # Cummulative true to use all previous data as training
+splits
+```
+
+It might be useful to visualize this in the context of the date ranges,
+this is shown in the plot below:
+
+```{r}
+splits %>% 
+  tk_time_series_cv_plan() %>% 
+  plot_time_series_cv_plan(.date_var = date,.value = value,.interactive= FALSE)
+```
+
+
+# Automatic Models (Parametric)
+
+The classical models that we will fit are the Auto Arima model, click see code
+to look at the model specifications:
+
+```{r}
+#| message: false
+#| warning : false
+# ARIMA Model
+set.seed(1234)
+model_fit_arima <- arima_reg() %>%
+  set_engine("auto_arima") %>%
+  fit(value ~ date, training(splits))
+
+```
+
+And the Prophet regression model, click see code to look at the model specifications:
+
+```{r}
+#| message: false
+#| warning: false
+set.seed(1234)
+model_fit_prophet <- prophet_reg() %>%
+  set_engine("prophet", yearly.seasonality = TRUE) %>%
+  fit(value ~ date, training(splits))
+
+```
+
+# Machine Learning Models
+
+The machine learning models ramp up in complexity and require pre processing 
+to ensure performance and compatibility. The data set below demonstrates
+the transformed data set:
+
+```{r}
+#| echo: false
+#| 
+#### Machine Learning Approach ####
+
+## More complex than auto models, and require the setting up of workflows.
+## The general approach has the following 3 steps:
+
+## Creating preprocessing recipe
+## We can use recipe() to add some variables that may be useful from a time series 
+## point of view:
+set.seed(1234)
+recipe_spec <- recipe(value ~ date, training(splits)) %>%
+  step_timeseries_signature(date) %>%
+   step_rm(contains("am.pm"), contains("hour"), contains("minute"),
+          contains("second"), contains("xts")) %>% 
+  step_fourier(date, period = 365, K = 5) %>% # K refers to the sine/cosine fourier series, increasing series increases variance at the expense of bais.
+  step_dummy(all_nominal())
+
+recipe_spec %>% prep() %>% juice() %>%
+  head(5) %>% glimpse()
+```
+
+Now that we have the recipe that will transform the data, we now need to 
+incorporate it into the workflow.
+
+## Elastic net
+
+The first of the machine learning models is a linear regression, with the 
+penalty and mixture parameters specified. 
+
+```{r}
+#| message: false
+#| warning: false
+
+set.seed(1234)
+model_spec_glmnet <- linear_reg(penalty = 0.01, mixture = 0.5) %>%
+  set_engine("glmnet")
+
+## Make a fitted workflow:
+
+workflow_fit_glmnet <- workflow() %>%
+  add_model(model_spec_glmnet) %>%
+  add_recipe(recipe_spec %>% step_rm(date)) %>%
+  fit(training(splits))
+```
+
+## Random Forest
+
+The second is the random forest model with 500 trees and minimum node size of
+50.
+
+```{r}
+#| message: false
+#| warning: false
+
+set.seed(1234)
+model_spec_rf <- rand_forest(trees = 500, min_n = 50) %>%
+  set_engine("randomForest")
+
+workflow_fit_rf <- workflow() %>%
+  add_model(model_spec_rf) %>%
+  add_recipe(recipe_spec %>% step_rm(date)) %>%
+  fit(training(splits))
+```
+
+# Hybrid models
+
+The hybrid models are a mix of the two approaches, combining automated methodologies
+with machine learning. 
+
+## Prophet Boost
+
+The first is the Prophet Boost model, which combines XG Boost with Prophet to get
+the best of both worlds. The model is specified below:
+
+```{r}
+#| message: false
+#| warning: false
+
+set.seed(1234)
+model_spec_prophet_boost <- prophet_boost() %>%
+  set_engine("prophet_xgboost", yearly.seasonality = TRUE) 
+
+workflow_fit_prophet_boost <- workflow() %>%
+  add_model(model_spec_prophet_boost) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(splits))
+
+```
+
+# Model Assessment
+
+Now that we have all the models fitted to our training data lets look at their
+respective performance. Putting our models into a table allows us to organise
+them and give them a unique identifier. 
+
+```{r}
+#| warning: false
+
+set.seed(1234)
+model_table <- modeltime_table(
+  model_fit_arima, 
+  model_fit_prophet,
+  workflow_fit_glmnet,
+  workflow_fit_rf,
+  workflow_fit_prophet_boost
+) 
+model_table
+```
+
+## Calibration
+
+Calibrating the data gives us the fitted values of the model along with the 
+residual values, this is shown in the table below:
+```{r}
+#| warning: false
+#| message: false
+
+set.seed(1234)
+calibration_table <- model_table %>%
+  modeltime_calibrate(testing(splits))
+
+calibration_table
+```
+
+Lets overlay these predictions on the actual data to see how far off we were
+relative to the test data set.
+
+```{r}
+## Forecasting on the test data:
+
+calibration_table %>%
+  modeltime_forecast(actual_data = dn_numbs_tbl) %>%
+  plot_modeltime_forecast(.interactive = TRUE) %>% 
+  layout(legend=list(orientation = 'h'))
+```
+
+
+The accuracy table below gives us a good idea of some metrics, as we can see 
+they are not great, but this is a proof of concept and daily as opposed to 
+wekly data would be more suitable, addressing these shortcomings along with 
+pre-processing experimentatioon will likely yield fruitful results.
+
+```{r}
+#| warning: false
+#| message: false
+calibration_table %>%
+  modeltime_accuracy() %>%
+  table_modeltime_accuracy(.interactive = FALSE)
+```
+
+From the table above it seems that the random forest model is performing best,
+lets proceed to predict the next 12 months:
+
+```{r}
+#| warning: false
+#| message: false
+
+set.seed(1234)
+calibration_table %>%
+# Remove ARIMA model with low accuracy
+  filter(!.model_id %in% c(2,3)) %>%
+  
+# Refit and Forecast Forward
+  modeltime_refit(dn_numbs_tbl) %>%
+  modeltime_forecast(h = "12 months", actual_data = dn_numbs_tbl) %>%
+  plot_modeltime_forecast(.interactive = TRUE) %>% 
+  layout(legend=list(orientation = 'h'))
+```
+
+Lets take a look at the predicitons relative to the productionised forecast 
+currently running:
+
+```{r}
+#| warning: false
+#| message: false
+
+set.seed(1234)
+calibration_table %>%
+  # Remove ARIMA model with low accuracy
+  filter(!.model_id %in% c(2,3)) %>%
+  
+  # Refit and Forecast Forward
+  modeltime_refit(dn_numbs_tbl) %>%
+  modeltime_forecast(h = "12 months", actual_data = dn_numbs_tbl) %>% 
+  select(.model_desc,.index,.value) -> Model_preds
+
+DN_numbs %>% select(DATE_KEY,REGISTRATION_FORECAST) %>% filter(REGISTRATION_FORECAST>0) %>% mutate(.model_desc="FORECAST") %>% rename(.index=DATE_KEY,.value=REGISTRATION_FORECAST) %>% select(.model_desc,.index,.value)->to_bind
+
+Model_preds %>% 
+  rbind(to_bind) -> Comparison_DF
+
+Comparison_DF %>% 
+  group_by(.model_desc) %>% 
+  filter(.index >= '2022-08-13') -> to_plot
+
+to_plot  %>% 
+  rename(Date=.index,Registrations=.value,Model=.model_desc) %>% 
+  ggplot(aes(Date,Registrations,color=Model))+
+  geom_line(size =1)+
+  scale_x_date(date_breaks = "6 weeks")+
+  scale_y_continuous(labels = scales::comma_format())+
+  ylab("Registrations")+
+  theme_minimal()+
+  theme(legend.position = "bottom")+
+  scale_color_manual(values = values) -> p
+
+plotly::ggplotly(p)  %>% 
+  layout(legend = list(orientation = 'h'))
+```
+
+
+## Variance Analysis
+
+It would be interesting to understand the extent to which we are over or under 
+predicting, the table below shows the averange variance and standard deviation
+for each model depending on whether or not it is over or under estimating, relative
+to the productionised forecast:
+
+```{r}
+#| warning: false
+#| message: false
+to_plot %>% 
+  pivot_wider(names_from = ".model_desc",
+              values_from = ".value") -> cal_variance
+
+
+cal_variance %>%
+  mutate(
+    Forecast_RF = RANDOMFOREST - FORECAST,
+    Forecast_AR = `UPDATE: ARIMA(1,1,2)` - FORECAST,
+    Forecast_XGB = `PROPHET W/ XGBOOST ERRORS` - FORECAST
+  ) %>%
+  select(.index, starts_with("Forecast")) %>%
+  pivot_longer(cols = FORECAST:Forecast_XGB) %>%
+  filter(name != "FORECAST" & .index <= '2023-03-04') %>%
+  mutate(flag = if_else(value < 0, "Under Forecasting", "Over Forecasting")) %>% 
+  mutate_if(is.numeric, abs) %>% 
+  group_by(name,flag) %>% 
+  summarise(mean_variance=mean(value),
+            sd=sd(value)) %>% 
+  knitr::kable()
+```
+
+The graph below demonstrates the table above in a plot, highlighting some interesting
+patterns across the models.
+
+```{r}
+#| message: false
+cal_variance %>%
+  mutate(
+    Forecast_RF = RANDOMFOREST - FORECAST,
+    Forecast_AR = `UPDATE: ARIMA(1,1,2)` - FORECAST,
+    Forecast_XGB = `PROPHET W/ XGBOOST ERRORS` - FORECAST
+  ) %>%
+  select(.index, starts_with("Forecast")) %>%
+  pivot_longer(cols = FORECAST:Forecast_XGB) %>%
+  filter(name != "FORECAST" & .index <= '2023-03-04') %>%
+  mutate(flag = if_else(value < 0, "Under Forecasting", "Over Forecasting")) %>% 
+  mutate_if(is.numeric, abs) %>% 
+  group_by(name,flag) %>% 
+  summarise(mean_variance=mean(value)) %>% 
+  ggplot(aes(name,mean_variance,fill=flag))+
+  geom_col(position = "dodge")+
+  scale_fill_manual(values = values)+
+  scale_y_continuous(labels = scales::comma_format())+
+  ylab("Mean Variance")+
+  xlab("")+
+  theme_minimal()+
+  theme(legend.position = "top")+
+  guides(fill=guide_legend(""))
+  
+```
+
+# Reccomendations & Future Directions
+
+
+
+
+
